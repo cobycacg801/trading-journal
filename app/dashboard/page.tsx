@@ -21,15 +21,11 @@ type TradeRow = {
   created_at: string;
   image_url?: string | null;
   account_mode: "REAL" | "PLAYBACK";
+  risk_percentage: number;
 };
 
-const STRATEGIES = [
-  { label: "BUY - T5 & T1 took minimum", code: "BUY_T5T1_TOOK_MIN" },
-  { label: "BUY - T5 & T1 did NOT take minimum", code: "BUY_T5T1_NO_MIN" },
-  { label: "SELL - T5 2UP + T1 touch prev candle", code: "SELL_T5_2UP_T1_TOUCH" },
-  { label: "SELL - T5 2BOTTOM + T1", code: "SELL_T5_2BOTTOM_T1" },
-  { label: "SELL - T5 3SEQ (up, below, below)", code: "SELL_T5_3SEQ" },
-];
+
+
 const PSYCHOLOGY_OPTIONS = [
   "Followed Plan",
   "Perfect Execution",
@@ -43,11 +39,87 @@ export default function DashboardPage() {
   const [email, setEmail] = useState<string>("");
   const [trades, setTrades] = useState<TradeRow[]>([]);
   const [msg, setMsg] = useState<string>("");
+  const [riskPercentage, setRiskPercentage] = useState(1.0);
+const [strategyCode, setStrategyCode] = useState('breakout');
+// --- Task 1: Strategies Management ---
+  const [strategies, setStrategies] = useState<{ label: string; code: string }[]>([]);
+  const [newStrategyName, setNewStrategyName] = useState('');
 
+  const addStrategy = () => {
+    if (newStrategyName.trim()) {
+      const newObj = { 
+        label: newStrategyName, 
+        code: newStrategyName.toLowerCase().trim().replace(/\s+/g, '-') 
+      };
+      setStrategies([...strategies, newObj]);
+      setNewStrategyName('');
+    }
+  };
+
+  const removeStrategy = (codeToRemove: string) => {
+    setStrategies(strategies.filter(s => s.code !== codeToRemove));
+  };
+  const renameStrategy = async (oldCode: string, newLabel: string) => {
+  const newCode = newLabel.toLowerCase().trim().replace(/\s+/g, '-');
+
+  // 1. Update the local state for a fast UI feel
+  setStrategies(prev => prev.map(s => s.code === oldCode ? { label: newLabel, code: newCode } : s));
+
+  // 2. CRITICAL: Update the database so old trades stay linked
+  const { error } = await supabase
+    .from('trades')
+    .update({ strategy_code: newCode })
+    .eq('strategy_code', oldCode);
+
+  if (error) console.error("Database sync failed:", error);
+};
+const handleLogout = async () => {
+  const { error } = await supabase.auth.signOut();
+  if (error) {
+    console.error('Error logging out:', error.message);
+  } else {
+    // This sends you back to your new Command Center
+    window.location.href = '/login';
+  }
+};
+// NEW: Futures Market Status Logic (CME Schedule)
+  const [isMarketOpen, setIsMarketOpen] = useState(false);
+
+  useEffect(() => {
+    const checkMarketStatus = () => {
+      // Syncs strictly to New York time for accurate exchange hours
+      const nyTime = new Date(new Date().toLocaleString("en-US", { timeZone: "America/New_York" }));
+      const day = nyTime.getDay(); // 0 = Sun, 1 = Mon, ..., 5 = Fri, 6 = Sat
+      const hours = nyTime.getHours(); // 0 to 23
+
+      let isOpen = false;
+
+      if (day === 0) {
+        // Sunday: Opens at 6:00 PM NY time
+        isOpen = hours >= 18;
+      } else if (day >= 1 && day <= 4) {
+        // Mon-Thu: Open 23 hours a day, halted strictly from 5 PM to 6 PM NY time
+        isOpen = hours !== 17;
+      } else if (day === 5) {
+        // Friday: Closes for the weekend at 5:00 PM NY time
+        isOpen = hours < 17;
+      } else if (day === 6) {
+        // Saturday: Closed all day
+        isOpen = false;
+      }
+
+      setIsMarketOpen(isOpen);
+    };
+
+    checkMarketStatus();
+    const interval = setInterval(checkMarketStatus, 60000); // Checks every minute
+    return () => clearInterval(interval);
+  }, []);
   // Form State
   const [tradeDate, setTradeDate] = useState<string>(() => new Date().toISOString().slice(0, 10));
   const [side, setSide] = useState<"BUY" | "SELL">("BUY");
   const [outcome, setOutcome] = useState<"TP" | "SL" | "BE">("TP");
+  const [rangeFilter, setRangeFilter] = useState('all');
   // 1. Smart State: Loads your saved capital from memory, or defaults to $0
   const [startingCapital, setStartingCapital] = useState<number>(() => {
     if (typeof window !== "undefined") {
@@ -65,18 +137,13 @@ export default function DashboardPage() {
     }
   }, [startingCapital]);
 
-  // 2. Auto-Save: Whenever you change the number, it saves instantly
-  useEffect(() => {
-    if (typeof window !== "undefined") {
-      localStorage.setItem("journalStartingCapital", startingCapital.toString());
-    }
-  }, [startingCapital]);
+ 
   const [accountMode, setAccountMode] = useState<"REAL" | "PLAYBACK">("REAL");
   const [instrumentType, setInstrumentType] = useState<string>("Future");
   const [instrumentSymbol, setInstrumentSymbol] = useState<string>("MNQ");
   const [marketType, setMarketType] = useState<string>("NY");
   const [schedule, setSchedule] = useState<string>("Morning");
-  const [strategyCode, setStrategyCode] = useState<string>(STRATEGIES[0].code);
+  
   const [pnlUsd, setPnlUsd] = useState<number>(150);
   const [notes, setNotes] = useState<string>("");
   const [psychology, setPsychology] = useState<string>(PSYCHOLOGY_OPTIONS[0]);
@@ -434,26 +501,105 @@ export default function DashboardPage() {
   const monthNames = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
  // --- SMART STRATEGY ALERTS ---
   // Scan for strategies that have at least 3 trades and a win rate below 40%
-  const underperformingStrategies = analytics.strategyPerformance.filter(
+  const underperformingstrategies = analytics.strategyPerformance.filter(
     (s) => s.count >= 3 && Number(s.winRate) < 40
   );
+ // NEW: Calculate Account Metrics
+  const totalNetProfit = trades?.reduce((sum, trade) => sum + (Number(trade.pnl_usd) || 0), 0) || 0;
+  const currentBalance = startingCapital + totalNetProfit;
   return (
     <div className="tj-bg">
-     {/* NEW: Top Navigation Bar */}
-      <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: "20px", width: "100%", maxWidth: "1200px", margin: "0 auto 20px auto" }}>
-        <button 
-          onClick={() => window.location.href = "/settings"}
-          style={{ background: "rgba(255,255,255,0.1)", border: "1px solid rgba(255,255,255,0.2)", color: "#fff", padding: "8px 16px", borderRadius: "8px", cursor: "pointer", fontWeight: "600", fontSize: "14px", transition: "all 0.2s" }}
-        >
-          ⚙️ Settings & Log Out
-        </button>
-      </div> 
+    {/* NEW: Top Navigation Bar with Market Status */}
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "20px", width: "100%", maxWidth: "1200px", margin: "0 auto 20px auto" }}>
+        
+        {/* Market Status Badge */}
+        <div style={{ 
+          display: "flex", alignItems: "center", gap: "8px", padding: "8px 16px", 
+          background: isMarketOpen ? "rgba(34, 197, 94, 0.1)" : "rgba(239, 68, 68, 0.1)", 
+          border: isMarketOpen ? "1px solid rgba(34, 197, 94, 0.2)" : "1px solid rgba(239, 68, 68, 0.2)", 
+          borderRadius: "8px", color: isMarketOpen ? "#22c55e" : "#ef4444", 
+          fontWeight: "800", fontSize: "12px", letterSpacing: "1px" 
+        }}>
+          <div style={{ 
+            width: "8px", height: "8px", borderRadius: "50%", 
+            background: isMarketOpen ? "#22c55e" : "#ef4444", 
+            boxShadow: isMarketOpen ? "0 0 10px #22c55e" : "0 0 10px #ef4444" 
+          }}></div>
+          {isMarketOpen ? "MARKET OPEN" : "MARKET CLOSED"}
+        </div>
+
+        {/* Action Buttons Container */}
+        <div style={{ display: "flex", gap: "10px" }}>
+          <button
+            onClick={() => window.location.href = "/settings"}
+            style={{ background: "rgba(255,255,255,0.1)", border: "1px solid rgba(255,255,255,0.2)", color: "#fff", padding: "8px 16px", borderRadius: "8px", cursor: "pointer", fontWeight: "600", fontSize: "14px", display: "flex", alignItems: "center", gap: "8px", transition: "all 0.2s" }}
+          >
+            ⚙️ Settings
+          </button>
+
+          <button
+            onClick={handleLogout}
+            style={{
+              background: "rgba(239, 68, 68, 0.1)", border: "1px solid rgba(239, 68, 68, 0.2)", color: "#ef4444", padding: "8px 16px", borderRadius: "8px", cursor: "pointer", fontWeight: "700", fontSize: "14px", transition: "all 0.2s"
+            }}
+            onMouseOver={(e) => e.currentTarget.style.background = "rgba(239, 68, 68, 0.2)"}
+            onMouseOut={(e) => e.currentTarget.style.background = "rgba(239, 68, 68, 0.1)"}
+          >
+            TERMINATE SESSION
+          </button>
+        </div>
+
+      </div>
+
+      {/* --- Dashboard Title & User Info (Restored) --- */}
       <div className="tj-card">
         <h2 style={{ fontSize: "24px", fontWeight: 800, marginBottom: "8px", color: "#fff" }}>Trading Dashboard</h2>
-        <div style={{ marginBottom: 20, color: "#9ca3af", fontSize: 14 }}>
+        <div style={{ marginBottom: "20px", color: "#9ca3af", fontSize: "14px" }}>
           Logged in as: <span style={{ color: "#fff", fontWeight: 600 }}>{email}</span>
         </div>
-{/* --- PHASE 3: ACCOUNT SWITCHER --- */}
+{/* --- ACCOUNT METRICS SUMMARY --- */}
+        <div style={{ 
+          display: "grid", 
+          gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", 
+          gap: "16px", 
+          marginTop: "24px",
+          marginBottom: "10px"
+        }}>
+          {/* Box 1: Starting Capital */}
+          <div style={{ background: "rgba(255,255,255,0.03)", padding: "20px", borderRadius: "12px", border: "1px solid rgba(255,255,255,0.05)" }}>
+            <div style={{ color: "#9ca3af", fontSize: "12px", fontWeight: 600, textTransform: "uppercase", letterSpacing: "1px", marginBottom: "8px" }}>
+              Starting Capital
+            </div>
+            <div style={{ color: "#fff", fontSize: "24px", fontWeight: 800 }}>
+              ${startingCapital.toLocaleString('en-US', { minimumFractionDigits: 2 })}
+            </div>
+          </div>
+
+          {/* Box 2: Total Net Profit */}
+          <div style={{ background: "rgba(255,255,255,0.03)", padding: "20px", borderRadius: "12px", border: "1px solid rgba(255,255,255,0.05)" }}>
+            <div style={{ color: "#9ca3af", fontSize: "12px", fontWeight: 600, textTransform: "uppercase", letterSpacing: "1px", marginBottom: "8px" }}>
+              Total Net Profit
+            </div>
+            <div style={{ color: totalNetProfit >= 0 ? "#22c55e" : "#ef4444", fontSize: "24px", fontWeight: 800 }}>
+              {totalNetProfit >= 0 ? "+" : "-"}${Math.abs(totalNetProfit).toLocaleString('en-US', { minimumFractionDigits: 2 })}
+            </div>
+          </div>
+
+          {/* Box 3: Current Balance */}
+          <div style={{ background: "rgba(255,255,255,0.03)", padding: "20px", borderRadius: "12px", border: "1px solid rgba(255,255,255,0.05)", position: "relative", overflow: "hidden" }}>
+            {/* Subtle glow effect for the balance box */}
+            <div style={{ position: "absolute", top: "-50%", left: "-50%", width: "200%", height: "200%", background: "radial-gradient(circle, rgba(59,130,246,0.05) 0%, transparent 70%)", zIndex: 0 }}></div>
+            <div style={{ position: "relative", zIndex: 1 }}>
+              <div style={{ color: "#9ca3af", fontSize: "12px", fontWeight: 600, textTransform: "uppercase", letterSpacing: "1px", marginBottom: "8px" }}>
+                Current Balance
+              </div>
+              <div style={{ color: "#fff", fontSize: "24px", fontWeight: 800 }}>
+                ${currentBalance.toLocaleString('en-US', { minimumFractionDigits: 2 })}
+              </div>
+            </div>
+          </div>
+        </div>
+      {/* --- PHASE 3: ACCOUNT SWITCHER --- */}
         <div style={{ display: "flex", gap: "8px", marginBottom: "20px" }}>
           <button 
             onClick={() => setAccountMode("REAL")}
@@ -491,7 +637,7 @@ export default function DashboardPage() {
           </button>
         </div>
         {/* SMART STRATEGY WARNING BANNER */}
-      {underperformingStrategies.length > 0 && (
+      {underperformingstrategies.length > 0 && (
         <div style={{ 
           background: "rgba(239, 68, 68, 0.05)", 
           border: "1px solid #ef4444", 
@@ -508,7 +654,7 @@ export default function DashboardPage() {
               STRATEGY BLEED ALERT
             </div>
             <div style={{ color: "#fca5a5", fontSize: "13px" }}>
-              Your win rate is critical on: <strong>{underperformingStrategies.map(s => s.code).join(", ")}</strong>. 
+              Your win rate is critical on: <strong>{underperformingstrategies.map(s => s.code).join(", ")}</strong>. 
               Review your rules before trading these setups again.
             </div>
           </div>
@@ -522,7 +668,7 @@ export default function DashboardPage() {
           <div style={{ background: "rgba(255,255,255,0.03)", padding: "24px", borderRadius: "12px", border: "1px solid rgba(255,255,255,0.1)" }}>
             <h2 style={{ fontSize: "18px", marginBottom: "20px", color: "#a5b4fc", fontWeight: 700 }}>Add New Trade</h2>
             
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: "12px" }}>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: "12px" }}>
               {/* Row 1 */}
               <div><label style={{ fontSize: "12px", color: "#9ca3af" }}>Date</label><input type="date" value={tradeDate} onChange={(e) => setTradeDate(e.target.value)} style={{ width: "100%", padding: "8px", background: "#000", border: "1px solid #333", color: "#fff", borderRadius: "4px" }} /></div>
               <div><label style={{ fontSize: "12px", color: "#9ca3af" }}>Side</label>
@@ -544,14 +690,75 @@ export default function DashboardPage() {
               </div>
               <div><label style={{ fontSize: "12px", color: "#9ca3af" }}>Symbol</label><input value={instrumentSymbol} onChange={(e) => setInstrumentSymbol(e.target.value)} placeholder="MNQ..." style={{ width: "100%", padding: "8px", background: "#000", border: "1px solid #333", color: "#fff", borderRadius: "4px" }} /></div>
               <div><label style={{ fontSize: "12px", color: "#9ca3af" }}>P&L ($)</label><input type="number" value={pnlUsd} onChange={(e) => setPnlUsd(Number(e.target.value))} style={{ width: "100%", padding: "8px", background: "#000", border: "1px solid #333", color: "#fff", borderRadius: "4px" }} /></div>
-
-              {/* Row 3 - Full Width Strategy */}
-              <div style={{ gridColumn: "span 3" }}>
-                <label style={{ fontSize: "12px", color: "#9ca3af" }}>Strategy</label>
-                <select value={strategyCode} onChange={(e) => setStrategyCode(e.target.value)} style={{ width: "100%", padding: "8px", background: "#000", border: "1px solid #333", color: "#fff", borderRadius: "4px" }}>
-                  {STRATEGIES.map((s) => <option key={s.code} value={s.code}>{s.label}</option>)}
-                </select>
-              </div>
+<div style={{ display: 'flex', flexDirection: 'column' }}>
+  <label style={{ fontSize: "12px", color: "#9ca3af" }}>Risk %</label>
+  <input 
+    type="number" 
+    step="0.1" 
+    value={riskPercentage} 
+    onChange={(e) => setRiskPercentage(Number(e.target.value))} 
+    style={{ width: "100%", padding: "8px", background: "#000", border: "1px solid #333", color: "#fff", borderRadius: "4px" }} 
+  />
+</div>
+{/* Market Type Restored */}
+          <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+            <label style={{ fontSize: "12px", color: "#9ca3af" }}>Market</label>
+            <select 
+              value={marketType} 
+              onChange={(e) => setMarketType(e.target.value)} 
+              style={{ 
+                padding: "10px", 
+                background: "#000", 
+                border: "1px solid #333", 
+                color: "#fff", 
+                borderRadius: "4px", 
+                outline: "none",
+                cursor: "pointer"
+              }}
+            >
+              <option value="Asia">Asia</option>
+              <option value="London">London</option>
+              <option value="NY">New York (NY)</option>
+            </select>
+          </div>
+ {/* Schedule (Time of Day) Restored */}
+          <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+            <label style={{ fontSize: "12px", color: "#9ca3af" }}>Schedule</label>
+            <select 
+              value={schedule} 
+              onChange={(e) => setSchedule(e.target.value)} 
+              style={{ 
+                padding: "10px", 
+                background: "#000", 
+                border: "1px solid #333", 
+                color: "#fff", 
+                borderRadius: "4px", 
+                outline: "none",
+                cursor: "pointer"
+              }}
+            >
+              <option value="Morning">Morning</option>
+              <option value="Afternoon">Afternoon</option>
+              <option value="Overnight">Overnight</option>
+            </select>
+          </div>        
+            <div style={{ gridColumn: "span 3" }}>
+  <label style={{ fontSize: "12px", color: "#9ca3af" }}>Strategy</label>
+  <input
+    type="text"
+    value={strategyCode}
+    onChange={(e) => setStrategyCode(e.target.value.toUpperCase())}
+    style={{ 
+      width: "100%", 
+      padding: "8px", 
+      background: "#000", 
+      border: "1px solid #333", 
+      color: "#fff", 
+      borderRadius: "4px" 
+    }}
+    placeholder="Enter Strategy (e.g., BUY_T5T1_TOOK_MIN)"
+  />
+</div>
 
               {/* Row 4 - Full Width Notes (Fixed Styling) */}
               <div style={{ gridColumn: "span 3" }}>
@@ -768,18 +975,46 @@ export default function DashboardPage() {
                     }}>
                       {strat.net > 0 ? "+" : ""}${strat.netFormatted}
                     </td>
-                    <td style={{ padding: "12px 8px" }}>
-                      <button 
-                        onClick={() => setSelectedStrategy(strat.code === selectedStrategy ? null : strat.code)}
-                        style={{
-                          background: selectedStrategy === strat.code ? "#08306b" : "#333",
-                          color: "#fff", border: "1px solid rgba(255,255,255,0.1)", padding: "4px 12px", 
-                          borderRadius: 6, cursor: "pointer", fontSize: 12, fontWeight: 600
-                        }}
-                      >
-                        {selectedStrategy === strat.code ? "Hide Chart" : "View Chart"}
-                      </button>
-                    </td>
+                    <td style={{ padding: "12px 8px", display: "flex", gap: "8px" }}>
+  {/* Existing View Chart Button */}
+  <button
+    onClick={() => setSelectedStrategy(strat.code === selectedStrategy ? null : strat.code)}
+    style={{
+      background: selectedStrategy === strat.code ? "#08306b" : "#333",
+      color: "#fff",
+      border: "1px solid rgba(255,255,255,0.1)",
+      padding: "4px 12px",
+      borderRadius: 6,
+      cursor: "pointer",
+      fontSize: 12,
+      fontWeight: 600
+    }}
+  >
+    {selectedStrategy === strat.code ? "Hide Chart" : "View Chart"}
+  </button>
+
+  {/* NEW Rename Button */}
+  <button
+    onClick={() => {
+      const newName = prompt("Enter new name for this strategy:", strat.code);
+      if (newName && newName.toUpperCase() !== strat.code) {
+        renameStrategy(strat.code, newName.toUpperCase());
+      }
+    }}
+    style={{
+      background: "transparent",
+      color: "#9ca3af",
+      border: "1px solid #333",
+      borderRadius: 6,
+      padding: "4px 12px",
+      fontSize: 12,
+      fontWeight: 600,
+      cursor: "pointer"
+    }}
+  >
+    Rename
+  </button>
+</td>
                   </tr>
                 ))
               )}
@@ -926,25 +1161,60 @@ export default function DashboardPage() {
 
         {/* Expandable Content */}
         {isTradesListOpen && (
+          
           <div style={{ marginTop: 12, background: "rgba(0,0,0,0.4)", borderRadius: 8, padding: 16, border: "1px solid rgba(255,255,255,0.05)" }}>
+         
+         {/* Task 3: Neon Filter Buttons */}
+<div style={{ display: 'flex', gap: '8px', marginBottom: '16px' }}>
+  {['all', 'week', 'month', 'year'].map((range) => (
+    <button 
+      key={range}
+      onClick={() => setRangeFilter(range)}
+      style={{
+        fontSize: '10px',
+        padding: '6px 16px',
+        borderRadius: '20px',
+        textTransform: 'uppercase',
+        fontWeight: '900',
+        backgroundColor: rangeFilter === range ? '#3b82f6' : '#111',
+        color: rangeFilter === range ? '#fff' : '#666',
+        border: '1px solid #333',
+        cursor: 'pointer',
+        boxShadow: rangeFilter === range ? '0 0 10px rgba(59, 130, 246, 0.5)' : 'none'
+      }}
+    >
+      {range}
+    </button>
+  ))}
+</div>
            {(() => {
-            // 1. The "Final Boss" Strict Filter
-            const displayTrades = trades.filter((t) => {
-              // Check exactly what the active button is
-              const isPlaybackActive = accountMode === "PLAYBACK";
-              // Check exactly what the database says
-              const isTradePlayback = (t.account_mode || "").toUpperCase() === "PLAYBACK";
-              
-              // If the button is Playback, but the trade is not... HIDE IT.
-              if (isPlaybackActive && !isTradePlayback) return false;
-              // If the button is Real, but the trade is Playback... HIDE IT.
-              if (!isPlaybackActive && isTradePlayback) return false;
-              
-              // Strategy filter
-              if (selectedStrategy && t.strategy_code !== selectedStrategy) return false;
-              
-              return true;
-            }).slice().reverse();
+        const displayTrades = trades.filter((t) => {
+  // 1. Account Mode Filter
+  const isPlaybackActive = accountMode === "PLAYBACK";
+  const isTradePlayback = (t.account_mode || "").toUpperCase() === "PLAYBACK";
+  if (isPlaybackActive && !isTradePlayback) return false;
+  if (!isPlaybackActive && isTradePlayback) return false;
+
+  // 2. Strategy Filter
+  if (selectedStrategy && t.strategy_code !== selectedStrategy) return false;
+
+  // 3. Time Range Filter (NEW)
+  if (rangeFilter !== 'all') {
+    const tradeDate = new Date(t.trade_date);
+    const now = new Date();
+    if (rangeFilter === 'week') {
+      const oneWeekAgo = new Date();
+      oneWeekAgo.setDate(now.getDate() - 7);
+      if (tradeDate < oneWeekAgo) return false;
+    } else if (rangeFilter === 'month') {
+      if (tradeDate.getMonth() !== now.getMonth() || tradeDate.getFullYear() !== now.getFullYear()) return false;
+    } else if (rangeFilter === 'year') {
+      if (tradeDate.getFullYear() !== now.getFullYear()) return false;
+    }
+  }
+
+  return true;
+}).slice().reverse();
 
             // 2. Calculate pagination
             const totalPages = Math.ceil(displayTrades.length / tradesPerPage);
@@ -968,10 +1238,11 @@ export default function DashboardPage() {
                         <span style={{ opacity: 0.9 }}>{t.trade_date} |</span>
                         <span style={{ color: sideColor, fontWeight: 700, width: 40 }}>{t.side}</span>
                       <span style={{ opacity: 0.9, flex: 1 }}>| {t.outcome} | {t.instrument_symbol} | {t.market_type} | {t.schedule} | <span style={{ color: "#60a5fa" }}>{t.strategy_code}</span> | <span style={{ color: t.psychology === "FOMO" || t.psychology === "Revenge Trade" || t.psychology === "Overleveraged" ? "#ef4444" : "#a855f7", fontWeight: 600 }}>{t.psychology || "N/A"}</span> |</span>  
+                     
                         <span style={{ color: pnlColor, fontWeight: 800, marginRight: 16 }}>
                           {pnl > 0 ? "+" : ""}${pnl.toFixed(2)}
                         </span>
-                        
+                       <span style={{ color: "#60a5fa", fontWeight: 800, width: 60, marginLeft: 10 }}>{t.risk_percentage}%</span> 
                        {/* Edit, Delete, and Image Actions */}
         <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
           {t.image_url ? (
