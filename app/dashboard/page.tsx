@@ -9,7 +9,7 @@ type TradeRow = {
   user_id: string;
   trade_date: string;
   side: "BUY" | "SELL";
-  outcome: "TP" | "SL";
+  outcome: "TP" | "SL" | "BE";
   instrument_type: string;
   instrument_symbol: string;
   market_type: string;
@@ -176,6 +176,46 @@ const handleLogout = async () => {
     }
     setTrades((data as TradeRow[]) ?? []);
   };
+
+const getStrategyStats = () => {
+  const stats: Record<string, { total: number, win: number, loss: number, be: number, pnl: number }> = {};
+
+  trades.forEach(t => {
+    const strat = t.strategy_code || 'Unknown';
+    if (!stats[strat]) {
+      stats[strat] = { total: 0, win: 0, loss: 0, be: 0, pnl: 0 };
+    }
+    
+    stats[strat].total++;
+    if (t.outcome === 'TP') stats[strat].win++;
+    if (t.outcome === 'SL') stats[strat].loss++;
+    if (t.outcome === 'BE') stats[strat].be++;
+    
+    // Sums P&L if it exists, otherwise adds 0 (perfect for your Excel data!)
+    stats[strat].pnl += Number(t.pnl_usd || 0);
+  });
+
+  return Object.entries(stats).map(([name, data]) => ({
+    name,
+    ...data,
+    winRate: data.win + data.loss > 0 
+      ? ((data.win / (data.win + data.loss)) * 100).toFixed(1) 
+      : "0.0"
+  })).sort((a, b) => Number(b.winRate) - Number(a.winRate)); // Sorts by best Win Rate
+};
+
+// --- Strategy & Profit Analysis Logic ---
+// 1. Filter trades to only include the current mode (REAL vs PLAYBACK)
+const currentModeTrades = trades.filter(t => t.account_mode === accountMode);
+
+// 2. Calculate profit ONLY for the active mode
+const totalNetProfit = currentModeTrades.reduce((sum, t) => sum + (Number(t.pnl_usd) || 0), 0);
+const currentBalance = Number(startingCapital) + totalNetProfit;
+
+// 3. Identify underperforming strategies ONLY within the current mode
+const underperformingStrategies = getStrategyStats()
+  .filter(s => currentModeTrades.some(t => (t.strategy_code || 'Unknown') === s.name))
+  .filter(s => Number(s.winRate) < 40 && s.total >= 3);
 
   // 1. Fetch trades on load
   useEffect(() => {
@@ -504,9 +544,7 @@ const handleLogout = async () => {
   const underperformingstrategies = analytics.strategyPerformance.filter(
     (s) => s.count >= 3 && Number(s.winRate) < 40
   );
- // NEW: Calculate Account Metrics
-  const totalNetProfit = trades?.reduce((sum, trade) => sum + (Number(trade.pnl_usd) || 0), 0) || 0;
-  const currentBalance = startingCapital + totalNetProfit;
+
   return (
     <div className="tj-bg">
     {/* NEW: Top Navigation Bar with Market Status */}
@@ -558,6 +596,7 @@ const handleLogout = async () => {
           Logged in as: <span style={{ color: "#fff", fontWeight: 600 }}>{email}</span>
         </div>
 {/* --- ACCOUNT METRICS SUMMARY --- */}
+       {accountMode === "REAL" && (
         <div style={{ 
           display: "grid", 
           gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", 
@@ -599,6 +638,7 @@ const handleLogout = async () => {
             </div>
           </div>
         </div>
+     )}
       {/* --- PHASE 3: ACCOUNT SWITCHER --- */}
         <div style={{ display: "flex", gap: "8px", marginBottom: "20px" }}>
           <button 
@@ -636,30 +676,31 @@ const handleLogout = async () => {
             PLAYBACK PRACTICE
           </button>
         </div>
+  
         {/* SMART STRATEGY WARNING BANNER */}
-      {underperformingstrategies.length > 0 && (
-        <div style={{ 
-          background: "rgba(239, 68, 68, 0.05)", 
-          border: "1px solid #ef4444", 
-          padding: "16px", 
-          borderRadius: "12px", 
-          marginBottom: "24px", 
-          display: "flex", 
-          alignItems: "center", 
-          gap: "16px" 
-        }}>
-          <div style={{ fontSize: "24px" }}>⚠️</div>
-          <div>
-            <div style={{ color: "#ef4444", fontWeight: 800, fontSize: "14px", marginBottom: "4px" }}>
-              STRATEGY BLEED ALERT
-            </div>
-            <div style={{ color: "#fca5a5", fontSize: "13px" }}>
-              Your win rate is critical on: <strong>{underperformingstrategies.map(s => s.code).join(", ")}</strong>. 
-              Review your rules before trading these setups again.
-            </div>
-          </div>
-        </div>
-      )}
+{underperformingStrategies.length > 0 && (
+  <div style={{
+    background: "rgba(239, 68, 68, 0.05)",
+    border: "1px solid #ef4444",
+    padding: "16px",
+    borderRadius: "12px",
+    marginBottom: "24px",
+    display: "flex",
+    alignItems: "center",
+    gap: "16px"
+  }}>
+    <div style={{ fontSize: "24px" }}>⚠️</div>
+    <div>
+      <div style={{ color: "#ef4444", fontWeight: 800, fontSize: "14px", marginBottom: "4px" }}>
+        STRATEGY BLEED ALERT ({accountMode})
+      </div>
+      <div style={{ color: "#fca5a5", fontSize: "13px" }}>
+        Your win rate is critical on: <strong>{underperformingStrategies.map(s => s.name).join(", ")}</strong>. 
+        Review your rules before trading these setups again in {accountMode} mode.
+      </div>
+    </div>
+  </div>
+)}
 
         {/* --- COMMAND CENTER --- */}
         <div style={{ display: "grid", gridTemplateColumns: "1.2fr 1fr", gap: "24px", alignItems: "start", marginBottom: "32px" }}>
@@ -1140,6 +1181,44 @@ const handleLogout = async () => {
             </div>
           )}
         </div>
+     
+     {/* -------- Strategy Performance Leaderboard -------- */}
+<div style={{ marginBottom: '32px' }}>
+  <h3 style={{ color: '#e5e7eb', marginBottom: '16px', fontSize: '18px' }}>Strategy Leaderboard</h3>
+  <div style={{ 
+    background: "rgba(20,20,20,0.95)", 
+    borderRadius: '8px', 
+    border: "1px solid rgba(255,255,255,0.05)",
+    overflow: 'hidden' 
+  }}>
+    <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left' }}>
+      <thead style={{ background: 'rgba(255,255,255,0.02)', color: '#9ca3af', fontSize: '12px', textTransform: 'uppercase' }}>
+        <tr>
+          <th style={{ padding: '12px 16px' }}>Strategy</th>
+          <th style={{ padding: '12px 16px' }}>Win Rate</th>
+          <th style={{ padding: '12px 16px' }}>Total P&L</th>
+          <th style={{ padding: '12px 16px' }}>Trades</th>
+        </tr>
+      </thead>
+      <tbody style={{ color: '#e5e7eb', fontSize: '14px' }}>
+        {getStrategyStats().map((strat) => (
+          <tr key={strat.name} style={{ borderTop: '1px solid rgba(255,255,255,0.05)' }}>
+            <td style={{ padding: '12px 16px', fontWeight: '600' }}>{strat.name}</td>
+            <td style={{ padding: '12px 16px', color: Number(strat.winRate) >= 50 ? '#4ade80' : '#f87171' }}>
+              {strat.winRate}%
+            </td>
+            <td style={{ padding: '12px 16px', color: strat.pnl >= 0 ? '#4ade80' : '#f87171' }}>
+              {strat.pnl >= 0 ? '+' : ''}${strat.pnl.toLocaleString(undefined, { minimumFractionDigits: 2 })}
+            </td>
+            <td style={{ padding: '12px 16px', color: '#9ca3af' }}>{strat.total}</td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  </div>
+</div>
+         
+     
         {/* -------- Trades list -------- */}
      {/* -------- Trades list (Collapsible & Paginated) -------- */}
       <div style={{ marginTop: 32, marginBottom: 40 }}>
