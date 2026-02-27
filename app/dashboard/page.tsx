@@ -180,8 +180,14 @@ const handleLogout = async () => {
 const getStrategyStats = () => {
   const stats: Record<string, { total: number, win: number, loss: number, be: number, pnl: number }> = {};
 
-  trades.forEach(t => {
-    const strat = t.strategy_code || 'Unknown';
+  // 1. FILTER BY MODE: This forces the Leaderboard to ONLY look at trades for your active tab!
+  const activeTrades = trades.filter(t => t.account_mode === accountMode);
+
+  activeTrades.forEach(t => {
+    // 2. THE DEEP CLEAN: Removes invisible characters, weird spaces, and forces exact case matching
+    const rawName = t.strategy_code || 'Unknown';
+    const strat = rawName.trim().replace(/\s+/g, ' ').toUpperCase();
+    
     if (!stats[strat]) {
       stats[strat] = { total: 0, win: 0, loss: 0, be: 0, pnl: 0 };
     }
@@ -191,7 +197,6 @@ const getStrategyStats = () => {
     if (t.outcome === 'SL') stats[strat].loss++;
     if (t.outcome === 'BE') stats[strat].be++;
     
-    // Sums P&L if it exists, otherwise adds 0 (perfect for your Excel data!)
     stats[strat].pnl += Number(t.pnl_usd || 0);
   });
 
@@ -201,7 +206,7 @@ const getStrategyStats = () => {
     winRate: data.win + data.loss > 0 
       ? ((data.win / (data.win + data.loss)) * 100).toFixed(1) 
       : "0.0"
-  })).sort((a, b) => Number(b.winRate) - Number(a.winRate)); // Sorts by best Win Rate
+  })).sort((a, b) => Number(b.winRate) - Number(a.winRate));
 };
 
 // --- Strategy & Profit Analysis Logic ---
