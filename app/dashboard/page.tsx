@@ -143,23 +143,47 @@ const handleLogout = async () => {
   const [instrumentSymbol, setInstrumentSymbol] = useState<string>("MNQ");
   const [marketType, setMarketType] = useState<string>("NY");
   const [schedule, setSchedule] = useState<string>("Morning");
+  const [selectedYear, setSelectedYear] = useState<string>("ALL");
+const [selectedMonth, setSelectedMonth] = useState<string>("ALL");
+
+// NEW: State for the specific strategy chart
+  const [selectedStrategy, setSelectedStrategy] = useState<string | null>(null);
+// 1. Filter trades based on selected date range and account mode
+      const filteredTrades = trades.filter(trade => {
+  // 1. Keep the Practice vs Real logic
+  const matchMode = trade.account_mode === accountMode;
   
-  const [pnlUsd, setPnlUsd] = useState<number>(150);
+  // 2. Add the Year logic
+  const tradeYear = trade.trade_date ? trade.trade_date.substring(0, 4) : "";
+  const matchYear = selectedYear === "ALL" || tradeYear === selectedYear;
+  
+  // 3. Add the Month logic
+  const tradeMonth = trade.trade_date ? trade.trade_date.substring(5, 7) : "";
+  const matchMonth = selectedMonth === "ALL" || tradeMonth === selectedMonth;
+
+  // --- NEW: STRATEGY CONNECTION ---
+    const tradeStrat = (trade.strategy_code || "Unknown").trim().toUpperCase();
+    const matchStrategy = !selectedStrategy || tradeStrat === selectedStrategy;
+
+    return matchMode && matchYear && matchMonth && matchStrategy;
+  });  
+const [pnlUsd, setPnlUsd] = useState<number>(150);
   const [notes, setNotes] = useState<string>("");
   const [psychology, setPsychology] = useState<string>(PSYCHOLOGY_OPTIONS[0]);
   const [imageFile, setImageFile] = useState<File | null>(null);
   const [editingId, setEditingId] = useState<number | null>(null);
   const [filterStartDate, setFilterStartDate] = useState<string>("");
   const [filterEndDate, setFilterEndDate] = useState<string>("");
-  const [selectedYear, setSelectedYear] = useState<string>("2026");
-// NEW: State for the specific strategy chart
-  const [selectedStrategy, setSelectedStrategy] = useState<string | null>(null);
+  
+
   // Calendar State
   const [calMonth, setCalMonth] = useState<number>(new Date().getMonth());
   const [calYear, setCalYear] = useState<number>(new Date().getFullYear());
   const [isCalendarOpen, setIsCalendarOpen] = useState<boolean>(false);
+  const [isImporting, setIsImporting] = useState<boolean>(false);
   // List & Pagination State
   const [isTradesListOpen, setIsTradesListOpen] = useState<boolean>(false);
+  const [isLeaderboardOpen, setIsLeaderboardOpen] = useState<boolean>(true);
   const [currentPage, setCurrentPage] = useState<number>(1);
   const tradesPerPage = 10;
   const fetchTrades = async () => {
@@ -181,24 +205,24 @@ const getStrategyStats = () => {
   const stats: Record<string, { total: number, win: number, loss: number, be: number, pnl: number }> = {};
 
   // 1. FILTER BY MODE: This forces the Leaderboard to ONLY look at trades for your active tab!
-  const activeTrades = trades.filter(t => t.account_mode === accountMode);
+  const activeTrades = filteredTrades; // Now it obeys Year, Month, AND Account Mode!
 
   activeTrades.forEach(t => {
-    // 2. THE DEEP CLEAN: Removes invisible characters, weird spaces, and forces exact case matching
-    const rawName = t.strategy_code || 'Unknown';
-    const strat = rawName.trim().replace(/\s+/g, ' ').toUpperCase();
-    
-    if (!stats[strat]) {
-      stats[strat] = { total: 0, win: 0, loss: 0, be: 0, pnl: 0 };
-    }
-    
-    stats[strat].total++;
-    if (t.outcome === 'TP') stats[strat].win++;
-    if (t.outcome === 'SL') stats[strat].loss++;
-    if (t.outcome === 'BE') stats[strat].be++;
-    
-    stats[strat].pnl += Number(t.pnl_usd || 0);
-  });
+  // Use Strategy_code (with a capital S) if that's what your CSV/Supabase uses
+  const rawName = t.strategy_code || 'Unknown';
+  const strat = rawName.trim().toUpperCase();
+  
+  if (!stats[strat]) {
+    stats[strat] = { total: 0, win: 0, loss: 0, be: 0, pnl: 0 };
+  }
+  
+  stats[strat].total++;
+  if (t.outcome === 'TP') stats[strat].win++;
+  else if (t.outcome === 'SL') stats[strat].loss++;
+  else if (t.outcome === 'BE') stats[strat].be++;
+  
+  stats[strat].pnl += Number(t.pnl_usd || 0);
+});
 
   return Object.entries(stats).map(([name, data]) => ({
     name,
@@ -237,6 +261,208 @@ const underperformingStrategies = getStrategyStats()
     init();
   }, []);
 
+ // --- BULK CSV IMPORT LOGIC ---
+const handleCleanSlate = async () => {
+  // We skip the "Confirm" and go straight to the "Type to Delete" box
+  const typedWord = window.prompt(
+    `DANGER: This will permanently delete ALL ${accountMode} trades.\n\nTo confirm, please type "DELETE" in the box below:`
+  );
+
+  // 1. If they hit "Cancel", typedWord will be null
+  // 2. If they type it wrong, it won't match "DELETE"
+  if (typedWord !== "DELETE") {
+    alert("Action cancelled. Your data is safe.");
+    return;
+  }
+
+  // If we get here, they typed it correctly!
+  setIsImporting(true);
+
+  try {
+    const { data: { user } } = await supabase.auth.getUser();
+    if (!user) throw new Error("User not authenticated");
+
+    const { error } = await supabase
+      .from("trades")
+      .delete()
+      .eq("account_mode", accountMode)
+      .eq("user_id", user.id);
+
+    if (error) throw error;
+
+    // Refresh everything
+    await fetchTrades();
+    alert(`Successfully cleared all ${accountMode} trades.`);
+  } catch (err: any) {
+    alert("Error clearing trades: " + err.message);
+  } finally {
+    setIsImporting(false);
+  }
+};
+ const handleFileUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
+  const file = event.target.files?.[0];
+  if (!file || !userId) return;
+
+  setIsImporting(true);
+  
+  const reader = new FileReader();
+  reader.onload = async (e) => {
+    const text = e.target?.result as string;
+    
+    // 1. Split file into rows
+    const lines = text.split('\n').filter(line => line.trim() !== '');
+    if (lines.length < 2) {
+      alert("File seems empty.");
+      setIsImporting(false);
+      return;
+    }
+
+    // 2. Identify exact column headers based on your NEW file names!
+    const headers = lines[0].split(',').map(h => h.trim().toLowerCase());
+    const dateIdx = headers.findIndex(h => h.includes('date'));
+    const outcomeIdx = headers.findIndex(h => h.includes('outcome'));
+    const sideIdx = headers.findIndex(h => h.includes('side'));
+    const pnlIdx = headers.findIndex(h => h.includes('p&l') || h.includes('pnl'));
+    const strategyIdx = headers.findIndex(h => h.includes('strategy'));
+    const notesIdx = headers.findIndex(h => h.includes('notes') || h.includes('analysis'));
+    
+    const instIdx = headers.findIndex(h => h.includes('instrument_type') || h.includes('inst'));
+    const symbolIdx = headers.findIndex(h => h.includes('symbol'));
+    const riskIdx = headers.findIndex(h => h.includes('risk'));
+    const marketIdx = headers.findIndex(h => h.includes('market')); 
+    const scheduleIdx = headers.findIndex(h => h.includes('schedule')); // Now explicitly looks for schedule!
+    const psychIdx = headers.findIndex(h => h.includes('psychology'));
+    const modeIdx = headers.findIndex(h => h.includes('account_mode'));
+
+    const parseCSVRow = (rowText: string) => {
+      let inQuotes = false, currentVal = '';
+      const row = [];
+      for (let char of rowText) {
+        if (char === '"') inQuotes = !inQuotes;
+        else if (char === ',' && !inQuotes) { row.push(currentVal.trim()); currentVal = ''; }
+        else currentVal += char;
+      }
+      row.push(currentVal.trim());
+      return row;
+    };
+
+    const tradesToInsert = [];
+    
+    // 3. Process every single trade in the file
+    for (let i = 1; i < lines.length; i++) {
+      const row = parseCSVRow(lines[i]);
+      if (row.length < 3) continue; 
+
+      const rawDate = dateIdx >= 0 && row[dateIdx] ? row[dateIdx] : "";
+      const rawOutcome = outcomeIdx >= 0 && row[outcomeIdx] ? row[outcomeIdx].toUpperCase() : "BE";
+      const rawSide = sideIdx >= 0 && row[sideIdx] ? row[sideIdx].toUpperCase() : "BUY";
+      const rawStrategy = strategyIdx >= 0 && row[strategyIdx] ? row[strategyIdx] : "Unknown";
+      const rawNotes = notesIdx >= 0 && row[notesIdx] ? row[notesIdx] : "";
+      
+      const rawInst = instIdx >= 0 && row[instIdx] ? row[instIdx] : "Future";
+      const rawSymbol = symbolIdx >= 0 && row[symbolIdx] ? row[symbolIdx] : "MNQ";
+      const rawRisk = riskIdx >= 0 && row[riskIdx] ? parseFloat(row[riskIdx]) : 1;
+      
+      const rawMarket = marketIdx >= 0 && row[marketIdx] ? row[marketIdx] : "New York (NY)";
+      const rawSchedule = scheduleIdx >= 0 && row[scheduleIdx] ? row[scheduleIdx] : "Morning";
+      const rawPsych = psychIdx >= 0 && row[psychIdx] ? row[psychIdx] : "Followed Plan";
+      
+      // Smart feature: It will read the PLAYBACK/REAL mode directly from your CSV now!
+      const rawMode = modeIdx >= 0 && row[modeIdx] ? row[modeIdx].toUpperCase() : accountMode;
+
+// --- FLEXIBLE P&L MATH (NinjaTrader Sync) ---
+      let pnlValue = 0;
+      if (pnlIdx >= 0 && row[pnlIdx]) {
+        // 1. Remove $, commas, and spaces
+        let cleanPnl = row[pnlIdx].replace(/[$,\s]/g, '');
+
+        // 2. Handle Parentheses (e.g., "(110.00)" -> "-110.00")
+        if (cleanPnl.startsWith('(') && cleanPnl.endsWith(')')) {
+          cleanPnl = '-' + cleanPnl.slice(1, -1);
+        }
+        
+        pnlValue = parseFloat(cleanPnl) || 0;
+      }
+
+      // 3. Logic Sync: Only intervene for Stop Losses to ensure they are negative
+      if (rawOutcome === 'SL') {
+        // If it's a loss, it MUST be negative. 
+        pnlValue = -Math.abs(pnlValue); 
+      } 
+      // BE and TP will now keep whatever exact decimal value came from your CSV!
+
+      // Format Date
+      let formattedDate = new Date().toISOString().split('T')[0];
+      try { if (rawDate) { const d = new Date(rawDate); if (!isNaN(d.getTime())) formattedDate = d.toISOString().split('T')[0]; } } catch(err) {}
+
+    const handleCleanSlate = async () => {
+  // 1. Safety First: Ask for confirmation
+  const confirmed = window.confirm(
+    `WARNING: This will permanently delete ALL ${accountMode} trades from your database. This cannot be undone. Are you sure?`
+  );
+
+  if (!confirmed) return;
+
+  setIsImporting(true); // Re-use the loading state
+
+  try {
+    // 2. Delete from Supabase based on the active tab (REAL or PLAYBACK)
+    const { error } = await supabase
+      .from("trades")
+      .delete()
+      .eq("account_mode", accountMode)
+      .eq("user_id", userId); // Critical: ensures you only delete your own data
+
+    if (error) throw error;
+
+    // 3. Refresh the UI
+    await fetchTrades();
+    alert(`Successfully cleared all ${accountMode} trades.`);
+  } catch (err: any) {
+    alert("Error clearing trades: " + err.message);
+  } finally {
+    setIsImporting(false);
+  }
+};
+    
+    
+      // Build the exact data package Supabase expects (Notice we are using "schedule" now!)
+      tradesToInsert.push({
+        user_id: userId,
+        trade_date: formattedDate,
+        side: rawSide,
+        outcome: rawOutcome,
+        pnl_usd: pnlValue,
+        strategy_code: rawStrategy,
+        notes: rawNotes,
+        account_mode: rawMode, 
+        instrument_type: rawInst, 
+        instrument_symbol: rawSymbol, 
+        risk_percentage: rawRisk,
+        market_type: rawMarket, 
+        schedule: rawSchedule,  // Changed this from 'market_session' to 'schedule' to fix the error!
+        psychology: rawPsych    // Added psychology support!
+      });
+    }
+
+    if (tradesToInsert.length > 0) {
+       const { error } = await supabase.from('trades').insert(tradesToInsert);
+       if (error) {
+          alert("Error importing to database: " + error.message);
+       } else {
+          alert(`Success! Imported ${tradesToInsert.length} trades.`);
+          await fetchTrades(); 
+       }
+    } else {
+       alert("No valid trades found to import.");
+    }
+    
+    setIsImporting(false);
+    event.target.value = '';
+  };
+  
+  reader.readAsText(file);
+};
   // --- Create or Update Trade ---
   const saveTrade = async () => {
     setMsg("");
@@ -369,36 +595,13 @@ const underperformingStrategies = getStrategyStats()
   };
 // --------- Analytics ---------
     const analytics = useMemo(() => {
-      // 1. Filter trades based on selected date range and account mode
-      const filteredTrades = trades.filter((t) => {
-      // --- THE STRICT ACCOUNT GATE ---
-          // 1. Clean up the database value: remove spaces and make it uppercase.
-          // If it's missing, assume it's a "REAL" trade.
-          const cleanDbMode = t.account_mode ? t.account_mode.trim().toUpperCase() : "REAL";
-
-          // 2. Explicitly classify the trade. It is either PLAYBACK or REAL. Nothing else.
-          const tradeMode = cleanDbMode === "PLAYBACK" ? "PLAYBACK" : "REAL";
-
-          // 3. Compare the trade's class with the button you clicked.
-          // If they don't match, hide the trade.
-          if (tradeMode !== accountMode) return false;
-          // -------------------------------  
-     
-        // 2. Filter by Selected Year (Unless "All Time" is chosen)
-        if (selectedYear !== "All" && !t.trade_date.startsWith(selectedYear)) return false;
-
-        // 3. Filter by specific custom date ranges
-        if (filterStartDate && t.trade_date < filterStartDate) return false;
-        if (filterEndDate && t.trade_date > filterEndDate) return false;
-
-        return true;
-      });
+      
  
 
     // 2. Base calculations
     const net = filteredTrades.reduce((a, t) => a + Number(t.pnl_usd), 0);
-    const wins = filteredTrades.filter((t) => Number(t.pnl_usd) > 0);
-    const losses = filteredTrades.filter((t) => Number(t.pnl_usd) < 0);
+    const wins = filteredTrades.filter((t) => t.outcome === 'TP'); // Only count TPs as wins
+    const losses = filteredTrades.filter((t) => t.outcome === 'SL'); // Only count SLs as losses
     const winRate = filteredTrades.length ? (wins.length / filteredTrades.length) * 100 : 0;
     const avgWin = wins.length ? wins.reduce((a, t) => a + Number(t.pnl_usd), 0) / wins.length : 0;
     const avgLoss = losses.length ? losses.reduce((a, t) => a + Number(t.pnl_usd), 0) / losses.length : 0;
@@ -478,7 +681,7 @@ const underperformingStrategies = getStrategyStats()
       cumulativeByDay, sideBars, filteredTrades, 
       strategyPerformance // <-- Now included securely in the return
     };
-  }, [trades, accountMode, filterStartDate, filterEndDate]);
+  }, [trades, accountMode, selectedYear, selectedMonth]);
 
   // ---------- Strategy Specific Chart Data ----------
   const strategyChartData = useMemo(() => {
@@ -712,7 +915,57 @@ const underperformingStrategies = getStrategyStats()
           
           {/* LEFT COLUMN: The Pro Form */}
           <div style={{ background: "rgba(255,255,255,0.03)", padding: "24px", borderRadius: "12px", border: "1px solid rgba(255,255,255,0.1)" }}>
-            <h2 style={{ fontSize: "18px", marginBottom: "20px", color: "#a5b4fc", fontWeight: 700 }}>Add New Trade</h2>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "20px" }}>
+  <h2 style={{ fontSize: "18px", color: "#a5b4fc", fontWeight: 700, margin: 0 }}>Add New Trade</h2>
+  
+  {/* The Hidden File Input and the Data Management Buttons */}
+  <div style={{ display: "flex", gap: "10px", alignItems: "center" }}>
+    <input 
+      type="file" 
+      accept=".csv" 
+      onChange={handleFileUpload} 
+      style={{ display: 'none' }} 
+      id="csv-upload" 
+    />
+    
+    {/* 1. The Import Button */}
+    <label 
+      htmlFor="csv-upload" 
+      style={{ 
+        cursor: 'pointer', 
+        background: "rgba(59, 130, 246, 0.1)", 
+        color: "#3b82f6", 
+        border: "1px solid #3b82f6",
+        padding: "8px 16px", 
+        borderRadius: "8px", 
+        fontSize: "12px",
+        fontWeight: "bold",
+        transition: "all 0.2s"
+      }}
+    >
+      {isImporting ? "⏳ IMPORTING..." : "📥 IMPORT CSV"}
+    </label>
+
+    {/* 2. The Clean Slate Button */}
+    <button
+  onClick={handleCleanSlate}
+  disabled={isImporting}
+  style={{
+    background: "rgba(239, 68, 68, 0.05)", // Very faint red
+    color: "#f87171",                   // Soft red text
+    border: "1px solid rgba(239, 68, 68, 0.4)",
+    padding: "8px 16px",
+    borderRadius: "8px",
+    fontSize: "12px",
+    fontWeight: "bold",
+    cursor: "pointer",
+    transition: "all 0.2s"
+  }}
+>
+  {isImporting ? "WAIT..." : `🗑️ WIPE ${accountMode}`}
+</button>
+  </div>
+</div> {/* This closing div corresponds to the flex header on line 875 */}
             
             <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: "12px" }}>
               {/* Row 1 */}
@@ -746,6 +999,28 @@ const underperformingStrategies = getStrategyStats()
     style={{ width: "100%", padding: "8px", background: "#000", border: "1px solid #333", color: "#fff", borderRadius: "4px" }} 
   />
 </div>
+{/* --- RESTORED PSYCHOLOGY DROPDOWN --- */}
+<div style={{ display: 'flex', flexDirection: 'column' }}>
+  <label style={{ fontSize: "12px", color: "#9ca3af" }}>Psychology</label>
+  <select 
+    value={psychology} 
+    onChange={(e) => setPsychology(e.target.value)} 
+    style={{ 
+      width: "100%", 
+      padding: "8px", 
+      background: "#000", 
+      border: "1px solid #333", 
+      color: "#fff", 
+      borderRadius: "4px" 
+    }}
+  >
+    {/* This maps through your PSYCHOLOGY_OPTIONS array */}
+    {PSYCHOLOGY_OPTIONS.map((opt) => (
+      <option key={opt} value={opt}>{opt}</option>
+    ))}
+  </select>
+</div>
+
 {/* Market Type Restored */}
           <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
             <label style={{ fontSize: "12px", color: "#9ca3af" }}>Market</label>
@@ -1094,7 +1369,11 @@ const underperformingStrategies = getStrategyStats()
         )}
         <hr style={{ margin: "18px 0" }} />
 
+
+       
+       
         {/* -------- Calendar View (Collapsible) -------- */}
+        {accountMode === "REAL" && (
         <div style={{ marginTop: 32 }}>
           {/* Toggle Button */}
           <button
@@ -1186,44 +1465,151 @@ const underperformingStrategies = getStrategyStats()
             </div>
           )}
         </div>
-     
+     )}
      {/* -------- Strategy Performance Leaderboard -------- */}
 <div style={{ marginBottom: '32px' }}>
-  <h3 style={{ color: '#e5e7eb', marginBottom: '16px', fontSize: '18px' }}>Strategy Leaderboard</h3>
+  {/* 1. The Header with the Toggle Button (Perfectly Proportioned) */}
+<div 
+  onClick={() => setIsLeaderboardOpen(!isLeaderboardOpen)}
+  style={{ 
+    display: "flex", 
+    justifyContent: "space-between", 
+    alignItems: "center", 
+    background: "rgba(20, 20, 20, 0.95)", 
+    border: "1px solid rgba(255, 255, 255, 0.05)",
+    borderRadius: "8px",
+    padding: "18px 20px", /* Increased to match the height of the other bars exactly */
+    marginBottom: "16px",
+    cursor: "pointer"
+  }}
+>
+  <div style={{ color: '#e5e7eb', fontSize: '16px', fontWeight: 'bold', fontFamily: 'sans-serif, system-ui' }}>
+    🏆 Strategy Leaderboard
+  </div>
+    <div style={{ color: "#9ca3af", fontSize: "14px", fontWeight: "bold" }}>
+    {isLeaderboardOpen ? "▲ Hide List" : "▼ Show List"}
+  </div>
+</div>
+
+{/* 2. The Opening Bracket to hide the table */}
+{isLeaderboardOpen && (
   <div style={{ 
     background: "rgba(20,20,20,0.95)", 
     borderRadius: '8px', 
     border: "1px solid rgba(255,255,255,0.05)",
     overflow: 'hidden' 
   }}>
-    <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left' }}>
+    <table style={{ width: '100%', borderCollapse: 'collapse', tableLayout: 'fixed' }}>
       <thead style={{ background: 'rgba(255,255,255,0.02)', color: '#9ca3af', fontSize: '12px', textTransform: 'uppercase' }}>
         <tr>
-          <th style={{ padding: '12px 16px' }}>Strategy</th>
-          <th style={{ padding: '12px 16px' }}>Win Rate</th>
-          <th style={{ padding: '12px 16px' }}>Total P&L</th>
-          <th style={{ padding: '12px 16px' }}>Trades</th>
+          {/* We set explicit widths here so they match your rows below */}
+          <th style={{ padding: '12px 16px', textAlign: 'left', width: '40%' }}>Strategy</th>
+          <th style={{ padding: '12px 16px', textAlign: 'center', width: '20%' }}>Win Rate</th>
+          <th style={{ padding: '12px 16px', textAlign: 'center', width: '25%' }}>Total P&L</th>
+          <th style={{ padding: '12px 16px', textAlign: 'right', width: '15%' }}>Trades</th>
         </tr>
       </thead>
       <tbody style={{ color: '#e5e7eb', fontSize: '14px' }}>
-        {getStrategyStats().map((strat) => (
-          <tr key={strat.name} style={{ borderTop: '1px solid rgba(255,255,255,0.05)' }}>
-            <td style={{ padding: '12px 16px', fontWeight: '600' }}>{strat.name}</td>
-            <td style={{ padding: '12px 16px', color: Number(strat.winRate) >= 50 ? '#4ade80' : '#f87171' }}>
-              {strat.winRate}%
-            </td>
-            <td style={{ padding: '12px 16px', color: strat.pnl >= 0 ? '#4ade80' : '#f87171' }}>
-              {strat.pnl >= 0 ? '+' : ''}${strat.pnl.toLocaleString(undefined, { minimumFractionDigits: 2 })}
-            </td>
-            <td style={{ padding: '12px 16px', color: '#9ca3af' }}>{strat.total}</td>
-          </tr>
-        ))}
+        {getStrategyStats().map((s) => (
+  <tr 
+    key={s.name}
+    onClick={() => setSelectedStrategy(s.name === selectedStrategy ? null : s.name)}
+    style={{ 
+      cursor: 'pointer',
+      background: selectedStrategy === s.name ? "rgba(165, 180, 252, 0.1)" : "transparent" 
+    }}
+  >
+    <td style={{ padding: '12px 16px', fontWeight: 'bold' }}>{s.name}</td>
+    <td style={{ padding: '12px 16px', textAlign: 'center' }}>{s.winRate}%</td>
+    <td style={{ padding: '12px 16px', textAlign: 'center', color: s.pnl >= 0 ? '#4ade80' : '#fb7185' }}>
+      ${s.pnl.toFixed(2)}
+    </td>
+    <td style={{ padding: '12px 16px', textAlign: 'right', color: '#9ca3af' }}>{s.total} trades</td>
+  </tr>
+))}
       </tbody>
     </table>
   </div>
+)}
 </div>
-         
-     
+              
+         {/* --- YEAR & MONTH FILTERS --- */}
+<div style={{ display: "flex", gap: "12px", alignItems: "center" }}>
+  
+  {/* Year Dropdown */}
+  <select 
+    value={selectedYear} 
+    onChange={(e) => setSelectedYear(e.target.value)}
+    style={{ 
+      background: "rgba(20,20,20,0.95)", 
+      color: "#e5e7eb", 
+      border: "1px solid rgba(255,255,255,0.1)", 
+      padding: "8px 16px", 
+      borderRadius: "6px",
+      fontSize: "14px",
+      cursor: "pointer",
+      outline: "none"
+    }}
+  >
+    <option value="ALL">All Years</option>
+    <option value="2026">2026</option>
+    <option value="2025">2025</option>
+    <option value="2024">2024</option>
+  </select>
+
+  {/* Month Dropdown */}
+  <select 
+    value={selectedMonth} 
+    onChange={(e) => setSelectedMonth(e.target.value)}
+    disabled={selectedYear === "ALL"} // Smart feature: Only unlocks if a year is chosen!
+    style={{ 
+      background: "rgba(20,20,20,0.95)", 
+      color: selectedYear === "ALL" ? "#4b5563" : "#e5e7eb", 
+      border: "1px solid rgba(255,255,255,0.1)", 
+      padding: "8px 16px", 
+      borderRadius: "6px",
+      fontSize: "14px",
+      cursor: selectedYear === "ALL" ? "not-allowed" : "pointer",
+      outline: "none"
+    }}
+  >
+    <option value="ALL">All Months</option>
+    <option value="01">January</option>
+    <option value="02">February</option>
+    <option value="03">March</option>
+    <option value="04">April</option>
+    <option value="05">May</option>
+    <option value="06">June</option>
+    <option value="07">July</option>
+    <option value="08">August</option>
+    <option value="09">September</option>
+    <option value="10">October</option>
+    <option value="11">November</option>
+    <option value="12">December</option>
+  </select>
+
+</div>   
+{selectedStrategy && (
+  <div 
+    onClick={() => setSelectedStrategy(null)}
+    style={{
+      display: "inline-flex",
+      alignItems: "center",
+      gap: "6px",
+      background: "rgba(165, 180, 252, 0.1)",
+      color: "#a5b4fc",
+      padding: "4px 10px",
+      borderRadius: "12px",
+      fontSize: "11px",
+      fontWeight: "bold",
+      cursor: "pointer",
+      border: "1px solid rgba(165, 180, 252, 0.3)",
+      marginLeft: "10px"
+    }}
+  >
+    STRATEGY: {selectedStrategy} ✕
+  </div>
+)}
         {/* -------- Trades list -------- */}
      {/* -------- Trades list (Collapsible & Paginated) -------- */}
       <div style={{ marginTop: 32, marginBottom: 40 }}>
@@ -1272,7 +1658,7 @@ const underperformingStrategies = getStrategyStats()
   ))}
 </div>
            {(() => {
-        const displayTrades = trades.filter((t) => {
+        const displayTrades = filteredTrades.filter((t) => {
   // 1. Account Mode Filter
   const isPlaybackActive = accountMode === "PLAYBACK";
   const isTradePlayback = (t.account_mode || "").toUpperCase() === "PLAYBACK";
